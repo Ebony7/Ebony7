@@ -1,0 +1,194 @@
+# ================== Setup Log Paths ==================
+$customLog = "C:\DBAScripts\SyncLoginsCustom.log"
+Remove-Item -Path $customLog -ErrorAction SilentlyContinue
+
+# ================== Connect to SQL Instances ==================
+$primary = Connect-DbaInstance -SqlInstance 'MIAPETLSQL02' -TrustServerCertificate
+$secondary = Connect-DbaInstance -SqlInstance 'FPMDB03QW-vm' -TrustServerCertificate
+$secondaries = @($secondary)   # <-- use $secondary, not $secondary1
+#===========if more than one secondary, '$secondaries = @($secondary1, $secondary2)'==========
+
+
+# ================== Get Logins from Primary ==================
+$sourceLogins = Get-DbaLogin -SqlInstance $primary |
+    Where-Object { $_.LoginType -ne 'Certificate' -and $_.Name -notmatch '^(NT|##|sa$|NT SERVICE\\)' }
+
+
+
+# ================== Write Header Title ==================
+Add-Content -Path $customLog -Value "`n========== Results of the SQL Login Synchronization Process ==========`n"
+
+
+# ================== Sync Logins, Roles, and Securables ==================
+foreach ($secondary in $secondaries) {
+    $changeLog = @()
+    $addedCount = 0
+    $updatedCount = 0
+    $failedCount = 0
+
+
+    foreach ($login in $sourceLogins) {
+        $loginName = $login.Name
+        $hasChanges = $false
+
+
+        try {
+            $loginExists = Get-DbaLogin -SqlInstance $secondary -Login $loginName -ErrorAction SilentlyContinue
+
+
+            if (-not $loginExists) {
+                try {
+                    Copy-DbaLogin -Source $primary -Destination $secondary -Login $loginName -Force -ErrorAction Stop
+                    $changeLog += "[$(Get-Date)] ? Added missing login '$loginName' to $($secondary.Name)."
+                    $addedCount++
+                    $hasChanges = $true
+                } catch {
+                    $changeLog += "[$(Get-Date)] ? Failed to copy login '$loginName': $_"
+                    $failedCount++
+                    continue
+                }
+            }
+
+
+            # Compare Server Roles
+            $primaryRoles = Get-DbaServerRole -SqlInstance $primary | Where-Object {
+                (Get-DbaServerRoleMember -SqlInstance $primary -ServerRole $_.Name -ErrorAction SilentlyContinue).Name -contains $loginName
+            } | Select-Object -ExpandProperty Name
+
+
+            $secondaryRoles = Get-DbaServerRole -SqlInstance $secondary | Where-Object {
+                (Get-DbaServerRoleMember -SqlInstance $secondary -ServerRole $_.Name -ErrorAction SilentlyContinue).Name -contains $loginName
+            } | Select-Object -ExpandProperty Name
+
+
+            $missingRoles = $primaryRoles | Where-Object { $_ -notin $secondaryRoles }
+
+
+            foreach ($role in $missingRoles) {
+                $roleExists = Get-DbaServerRole -SqlInstance $secondary | Where-Object { $_.Name -eq $role }
+                if ($roleExists) {
+                    try {
+                        Add-DbaServerRoleMember -SqlInstance $secondary -Login $loginName -ServerRole $role -Confirm:$false -ErrorAction Stop
+                        $changeLog += "[$(Get-Date)] ?? Added role '$role' to login '$loginName' on $($secondary.Name)."
+                        $updatedCount++
+                        $hasChanges = $true
+                    } catch {
+                        $changeLog += "[$(Get-Date)] ? Failed to add role '$role' to login '$loginName': $_"
+                        $failedCount++
+                    }
+                }
+            }
+
+
+            # Compare and Sync Server-Level Permissions
+            $primaryPerms = Invoke-DbaQuery -SqlInstance $primary -Query "
+                SELECT class_desc, major_id, permission_name, state_desc
+                FROM sys.server_permissions
+                WHERE grantee_principal_id = SUSER_ID('$loginName')
+            "
+
+
+            $secondaryPerms = Invoke-DbaQuery -SqlInstance $secondary -Query "
+                SELECT class_desc, major_id, permission_name, state_desc
+                FROM sys.server_permissions
+                WHERE grantee_principal_id = SUSER_ID('$loginName')
+            "
+
+
+            foreach ($perm in $primaryPerms) {
+                $exists = $secondaryPerms | Where-Object {
+                    $_.permission_name -eq $perm.permission_name -and
+                    $_.state_desc -eq $perm.state_desc -and
+                    $_.class_desc -eq $perm.class_desc -and
+                    $_.major_id -eq $perm.major_id
+                }
+
+
+                if (-not $exists -and $perm.class_desc -eq 'SERVER') {
+                    try {
+                        $grantSql = "GRANT $($perm.permission_name) TO [$loginName];"
+                        Invoke-DbaQuery -SqlInstance $secondary -Query $grantSql
+                        $changeLog += "[$(Get-Date)] ?? Granted '$($perm.permission_name)' to '$loginName' on $($secondary.Name)."
+                        $updatedCount++
+                        $hasChanges = $true
+                    } catch {
+                        $changeLog += "[$(Get-Date)] ? Failed to grant '$($perm.permission_name)' to '$loginName': $_"
+                        $failedCount++
+                    }
+                }
+            }
+
+
+        } catch {
+            $changeLog += "[$(Get-Date)] ? Error processing login '$loginName': $_"
+            $failedCount++
+        }
+    }
+
+
+    # Write changes or no-change summary to main log
+    if ($addedCount -eq 0 -and $updatedCount -eq 0 -and $failedCount -eq 0) {
+        Add-Content -Path $customLog -Value "[$(Get-Date)] ?? No changes made on $($secondary.Name)."
+    } else {
+        Add-Content -Path $customLog -Value "`n[$(Get-Date)] ?? Sync results for $($secondary.Name):"
+        $changeLog | ForEach-Object { Add-Content -Path $customLog -Value $_ }
+
+
+        Add-Content -Path $customLog -Value @"
+[$(Get-Date)] ? Summary for $($secondary.Name):
+    Logins Added    : $addedCount
+    Logins Updated  : $updatedCount
+    Logins Failed   : $failedCount
+"@
+    }
+}
+
+
+# ================== Send Email via Database Mail ==================
+$logBody = Get-Content -Path $customLog -Raw
+$escapedBody = $logBody -replace "'", "''"
+
+
+$sql = @"
+EXEC msdb.dbo.sp_send_dbmail
+    @profile_name = 'DB Mail profile',
+    @recipients = 'your email', # replace this with your actual email
+    @subject = 'AG Login Sync Report - $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")',
+    @body = N'$escapedBody',
+    @body_format = 'Text';
+"@
+
+
+Invoke-Sqlcmd -ServerInstance 'MIAPETLSQL02' -Query $sql 
+
+
+#=================================================================
+# ... your login/role/permission sync code ...
+# === Agent sync (DROP-IN REPLACEMENT) ===
+# Name of THIS job (the one doing the sync) so we don't copy/drop it on the fly
+$SyncJobName = 'Sync_Logins_AlwaysOn'   # <-- change to your exact job name
+
+# Get job NAMES only, exclude system jobs and the sync job itself
+$jobNames = (Get-DbaAgentJob -SqlInstance $primary |
+    Where-Object { -not $_.IsSystemObject -and $_.Name -ne $SyncJobName }
+).Name
+
+# Bring over Operators / Proxies first (if you use them)
+Copy-DbaAgentOperator -Source $primary -Destination $secondary -Force -Verbose
+Copy-DbaAgentProxy    -Source $primary -Destination $secondary -Force -Verbose
+
+# Copy jobs by name (strings). Either use filtered list...
+Copy-DbaAgentJob -Source $primary -Destination $secondary -Job $jobNames -Force -Verbose
+# ...or equivalently: Copy-DbaAgentJob -Source $primary -Destination $secondary -ExcludeJob $SyncJobName -Force -Verbose
+
+# Normalize owners on destination to avoid orphaned owners
+foreach ($jn in $jobNames) {
+    Set-DbaAgentJobOwner -SqlInstance $secondary -Job $jn -Login 'sa' -ErrorAction SilentlyContinue
+}
+
+# (Optional) Prevent jobs from running on secondaries
+# Disable-DbaAgentJob -SqlInstance $secondary -Job $jobNames -ErrorAction SilentlyContinue
+
+
+
+

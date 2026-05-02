@@ -1,0 +1,144 @@
+
+-- Create a login to run the assessment
+
+use master;
+
+DECLARE @SID NVARCHAR(MAX) = N'';
+
+CREATE LOGIN [NK\svc_azmigsqldiscvr] FROM WINDOWS;
+
+SELECT @SID = N'0x'+CONVERT(NVARCHAR, sid, 2) FROM sys.syslogins where name = 'NK\svc_azmigsqldiscvr'
+
+IF (ISNULL(@SID,'') != '')
+
+  PRINT N'Created login [NK\svc_azmigsqldiscvr] with SID = ' + @SID
+
+ELSE
+
+  PRINT N'Login creation failed'
+
+GO    
+ 
+-- Create user in every database other than tempdb, model, and secondary AG databases (with connection_type = ALL) and provide minimal read-only permissions.
+
+USE master;
+
+EXECUTE sp_MSforeachdb '
+
+  USE [?];
+
+  IF (''?'' NOT IN (''tempdb'',''model''))
+
+  BEGIN
+
+    DECLARE @is_secondary_replica BIT = 0;
+
+    IF CAST(PARSENAME(CAST(SERVERPROPERTY(''ProductVersion'') AS VARCHAR), 4) AS INT) >= 11
+
+    BEGIN
+
+      DECLARE @innersql NVARCHAR(MAX);
+
+      SET @innersql = N''
+
+        SELECT @is_secondary_replica = IIF(
+
+          EXISTS (
+
+              SELECT 1
+
+              FROM sys.availability_replicas a
+
+              INNER JOIN sys.dm_hadr_database_replica_states b
+
+              ON a.replica_id = b.replica_id
+
+              WHERE b.is_local = 1
+
+              AND b.is_primary_replica = 0
+
+              AND a.secondary_role_allow_connections = 2
+
+              AND b.database_id = DB_ID()
+
+          ), 1, 0
+
+        );
+
+      '';
+
+      EXEC sp_executesql @innersql, N''@is_secondary_replica BIT OUTPUT'', @is_secondary_replica OUTPUT;
+
+    END
+
+    IF (@is_secondary_replica = 0)
+
+    BEGIN
+
+      CREATE USER [NK\svc_azmigsqldiscvr] FOR LOGIN [NK\svc_azmigsqldiscvr];
+
+      GRANT SELECT ON sys.sql_expression_dependencies TO [NK\svc_azmigsqldiscvr];
+
+      GRANT VIEW DATABASE STATE TO [NK\svc_azmigsqldiscvr];
+
+    END
+
+  END'
+
+GO
+ 
+-- Provide server level read-only permissions
+
+use master;
+
+GRANT SELECT ON sys.sql_expression_dependencies TO [NK\svc_azmigsqldiscvr];
+
+GRANT EXECUTE ON OBJECT::sys.xp_regenumkeys TO [NK\svc_azmigsqldiscvr];
+
+GRANT EXECUTE ON OBJECT::sys.xp_instance_regread TO [NK\svc_azmigsqldiscvr];
+
+GRANT VIEW DATABASE STATE TO [NK\svc_azmigsqldiscvr];
+
+GRANT VIEW SERVER STATE TO [NK\svc_azmigsqldiscvr];
+
+GRANT VIEW ANY DEFINITION TO [NK\svc_azmigsqldiscvr];
+
+GO
+ 
+-- Provide msdb specific permissions
+
+use msdb;
+
+GRANT EXECUTE ON [msdb].[dbo].[agent_datetime] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[sysjobsteps] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[syssubsystems] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[sysjobhistory] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[syscategories] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[sysjobs] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[sysmaintplan_plans] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[syscollector_collection_sets] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[sysmail_profile] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[sysmail_profileaccount] TO [NK\svc_azmigsqldiscvr];
+
+GRANT SELECT ON [msdb].[dbo].[sysmail_account] TO [NK\svc_azmigsqldiscvr];
+
+GO
+ 
+-- Clean up
+
+--use master;
+
+-- EXECUTE sp_MSforeachdb 'USE [?]; DROP USER [NK\svc_azmigsqldiscvr]'
+
+-- DROP LOGIN [NK\svc_azmigsqldiscvr];
+
+--GO
